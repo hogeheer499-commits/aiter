@@ -79,6 +79,18 @@ def dao_ai_impl():
         # seqlen_q != seqlen_k at production size exercises the causal_offset /
         # delta_qk arithmetic with a window spanning many blocks.
         (1, 4096, 8192, 8, 8, 64, True, False, True, (256, 0)),  # large causal sq != sk
+        # Padded last block: seqlen NOT a multiple of the block size, with an active
+        # window -> exercises handle_padded_last_block (the last partial-K-block bucket
+        # move). Every multiple-of-block case above skips this branch. sq == sk keeps
+        # every query row with at least the diagonal key (no fully-masked rows).
+        (1, 1023, 1023, 8, 8, 64, True, False, True, (128, 0)),  # causal
+        (1, 1025, 1025, 8, 8, 64, False, False, True, (64, 64)),  # symmetric
+        (1, 4097, 4097, 8, 8, 64, True, False, True, (256, 0)),  # production size
+        (1, 1024, 1024, 8, 8, 64, False, False, True, (0, 0)),  # (0,0) band
+        # Broaden the production block-skip regime past hd64 / MHA: block sizes are
+        # head-dim dependent and MQA changes the block-classification arithmetic.
+        (1, 4096, 4096, 8, 8, 128, True, False, True, (256, 0)),  # hd128
+        (2, 4096, 4096, 8, 1, 64, True, False, True, (256, 0)),  # MQA
     ],
 )
 def test_mha_dao_ai(
@@ -93,7 +105,7 @@ def test_mha_dao_ai(
     VARLEN: bool,
     BWD: bool,
     WINDOW_SIZE: tuple[int, int],
-    dtype=torch.float16,
+    dtype=torch.bfloat16,
 ):
     """Test dao_ai impl dispatch for fwd/bwd x varlen against PyTorch reference."""
     torch.cuda.empty_cache()
@@ -253,13 +265,13 @@ def test_mha_dao_ai_negative_right_window_raises(dao_ai_impl):
     """
     torch.manual_seed(20)
     q = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+        1, 128, 8, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     k = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+        1, 128, 8, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
     v = torch.randn(
-        1, 128, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True
+        1, 128, 8, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
     )
 
     # window_size=(32, -1): finite left, negative right -> sliding window active
@@ -279,7 +291,7 @@ def test_mha_dao_ai_graph(dao_ai_impl, mha_type, default_device):
     seqlen = 128
     nheads = 8
     nheads_k = nheads if mha_type == "mha" else 2
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
@@ -329,7 +341,7 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
     seqlen = 128
     nheads = 8
     nheads_k = nheads if mha_type == "mha" else 2
-    dtype = torch.float16
+    dtype = torch.bfloat16
 
     q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads_k, d, device=device, dtype=dtype)
