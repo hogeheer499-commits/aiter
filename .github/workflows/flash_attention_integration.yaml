@@ -178,6 +178,21 @@ jobs:
       - name: Build Docker image (v2)
         run: docker build -t fa_triton_test:ci -f Dockerfile.triton .
 
+      # Persist the Triton JIT cache across runs via the GH cache backend (node-
+      # independent; nothing left on the runners). Kernel compilation dominates these
+      # GPU test steps, so a warm cache keeps them under their step timeouts. Keyed per
+      # arch + commit SHA (restore-keys warm-starts from the previous commit; only
+      # changed kernels recompile). Pure speed layer: Triton keys each kernel by its own
+      # content hash, so a cache hit never serves a stale kernel. Mounted below at
+      # /root/.triton.
+      - name: Triton JIT cache
+        uses: actions/cache@v4
+        with:
+          path: .triton-cache
+          key: triton-${{ matrix.label }}-${{ github.sha }}
+          restore-keys: |
+            triton-${{ matrix.label }}-
+
       - name: Start CI container (v2)
         run: |
           docker ps -aq -f name=fa_triton_test | xargs -r docker stop | xargs -r docker rm || true
@@ -188,12 +203,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_test \
             fa_triton_test:ci
@@ -295,12 +314,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_v3_test \
             fa_triton_v3_test:ci
