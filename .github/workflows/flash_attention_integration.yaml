@@ -234,8 +234,10 @@ jobs:
           " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
 
+      # Full correctness suite (output + varlen + kvcache) — runs on MI35X (and any
+      # non-RDNA arch). RDNA3 has its own reduced version below.
       - name: PR correctness tests (v2)
-        if: ${{ github.event_name != 'push' }}
+        if: ${{ github.event_name != 'push' && matrix.label != 'RDNA3' }}
         timeout-minutes: 90
         run: |
           docker exec fa_triton_test bash -c "
@@ -251,6 +253,21 @@ jobs:
             pytest -v --reruns 2 --timeout=120 \
               tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
               -k '16-20000'
+          "
+
+      # RDNA3 is much slower (and optional), so the full varlen + kvcache sweep blows
+      # the 90-min cap. It runs only the output test.
+      - name: PR correctness tests (v2) [RDNA3]
+        if: ${{ github.event_name != 'push' && matrix.label == 'RDNA3' }}
+        timeout-minutes: 90
+        run: |
+          docker exec fa_triton_test bash -c "
+            cd /flash-attention
+            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
+            pytest -v --reruns 2 --timeout=120 \
+              tests/test_flash_attn_triton_amd.py::test_flash_attn_output \
+              -k '2048-2048'
           "
 
       - name: Post-merge correctness tests (v2)
