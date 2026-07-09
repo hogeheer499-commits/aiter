@@ -217,7 +217,7 @@ jobs:
             --name fa_triton_test \
             fa_triton_test:ci
 
-      - name: Run benchmarks (v2)
+      - name: Run FA benchmark (v2)
         if: ${{ github.event_name != 'push' }}
         timeout-minutes: 60
         run: |
@@ -227,6 +227,14 @@ jobs:
             FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
             python benchmarks/benchmark_flash_attention.py
           " |& tee benchmark_fa_triton_${{ matrix.label }}.log
+
+      # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
+      # (all arches) and on push-to-main for MI35X, where the baseline is published.
+      - name: Run MHA bench (v2)
+        if: ${{ github.event_name != 'push' || matrix.label == 'MI35X' }}
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
           docker exec fa_triton_test bash -c "
             cd /aiter
             python op_tests/op_benchmarks/triton/bench_mha.py \
@@ -388,8 +396,17 @@ jobs:
       # ===========================================
       # Artifacts
       # ===========================================
+      # The single home for the MHA bench CSV: the current-run source for the PR
+      # perf compare (fa_mha_bench job) AND, on push-to-main, the baseline it diffs
+      # against (fetched by commit). One artifact, 90-day retention so a baseline
+      # outlives the raw run. Uploaded on PRs (all arches) and push-to-main (MI35X,
+      # for the baseline). push only fires on main, so no ref guard is needed.
       - name: Upload benchmark results
-        if: ${{ success() && github.event_name != 'push' }}
+        if: ${{ success() && (github.event_name != 'push' || matrix.label == 'MI35X') }}
+        # Best-effort: the bench already ran, and GitHub's artifact backend times out
+        # transiently (CreateArtifact), so an upload flake must not fail the whole bench
+        # job. A missing artifact just means the PR compare warns "no baseline" (warn-only).
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: flash-attention-triton-benchmark-${{ matrix.label }}
@@ -397,7 +414,94 @@ jobs:
             benchmark_fa_triton_${{ matrix.label }}.log
             benchmark_mha_daoai_${{ matrix.label }}.log
             bench_dao_ai_${{ matrix.label }}/
-          retention-days: 7
+          retention-days: 90
+
+  # =============================================================================
+  # FA MHA Bench (main-vs-branch perf compare)
+  # =============================================================================
+  # On a PR: diff the PR's MHA bench CSV against the last main baseline with
+  # compare_mha.py (throughput, higher=faster) and write the table to the job
+  # summary. Warn-only. CPU-only (compare_mha.py is stdlib, no GPU), so it runs
+  # off the GPU runner. Mirrors the tuned_op_bench job in aiter-test.yaml.
+  # CSVs come from the MI35X leg only (single arch, no cross-arch noise).
+  fa_mha_bench:
+    name: FA MHA Bench
+    if: >-
+      always() && !cancelled() &&
+      !github.event.pull_request.draft &&
+      github.event_name == 'pull_request'
+    needs: [flash_attention_triton]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download current MHA bench CSV (MI35X)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/current/
+
+      - name: Locate current CSV
+        id: current
+        run: |
+          csv=$(find /tmp/current -name bench_mha.csv 2>/dev/null | head -1)
+          if [[ -z "$csv" ]]; then
+            echo "::warning::No current MHA bench CSV found (MI35X leg may have failed); skipping perf compare."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$csv" /tmp/current.csv
+          echo "Current CSV: $csv ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/baseline_pinned/
+          if_no_artifact_found: warn
+
+      - name: Fallback baseline from latest main
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          branch: main
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/baseline_main/
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          baseline_csv=$(find /tmp/baseline_pinned -name bench_mha.csv 2>/dev/null | head -1)
+          if [[ -z "$baseline_csv" ]]; then
+            baseline_csv=$(find /tmp/baseline_main -name bench_mha.csv 2>/dev/null | head -1)
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+            echo "::warning::No MHA bench baseline found; skipping perf compare."
+            {
+              echo "## FA MHA Bench"
+              echo
+              echo "_No baseline available. First run, or main has not published a baseline yet._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## FA MHA Bench (vs main baseline, MI35X)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 op_tests/op_benchmarks/triton/compare_mha.py \
+            "$baseline_csv" /tmp/current.csv | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # Windows Smoke Test

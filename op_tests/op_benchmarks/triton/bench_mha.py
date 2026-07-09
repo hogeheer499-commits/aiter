@@ -110,24 +110,29 @@ class BenchConfig:
             total *= 2  # grads are same size as inputs
         return total
 
-    def to_tuple(self) -> tuple:
-        return (
-            self.model,
-            self.batch,
-            self.hq,
-            self.hk,
-            self.sq,
-            self.sk,
-            self.d_head,
-            self.d_head_v,
-            self.causal,
-            self.function,
-            self.dtype_str,
-            self.impl,
-            self.fused,
-            self.window_size_left,
-            self.window_size_right,
-        )
+    def to_dict(self) -> dict:
+        """The row's key columns as {csv_column: value}, in CSV order: the single
+        source of truth for the CSV header, the triton x-axis, and each written row
+        (the metric is appended separately by the writer, being the measurement, not
+        a key). CSV names differ from the field names as they are the boundary contract.
+        """
+        return {
+            "model": self.model,
+            "BATCH": self.batch,
+            "HQ": self.hq,
+            "HK": self.hk,
+            "N_CTX_Q": self.sq,
+            "N_CTX_K": self.sk,
+            "D_HEAD": self.d_head,
+            "D_HEAD_V": self.d_head_v,
+            "causal": self.causal,
+            "function": self.function,
+            "dtype": self.dtype_str,
+            "impl": self.impl,
+            "fused": self.fused,
+            "window_left": self.window_size_left,
+            "window_right": self.window_size_right,
+        }
 
 
 def _count_valid_attention_elements(
@@ -411,27 +416,13 @@ def pad_rearrange_dropout_mask(
 
 
 def _make_triton_benchmark(run: BenchRun) -> list:
-    x_names = [
-        "model",
-        "BATCH",
-        "HQ",
-        "HK",
-        "N_CTX_Q",
-        "N_CTX_K",
-        "D_HEAD",
-        "D_HEAD_V",
-        "causal",
-        "function",
-        "dtype",
-        "impl",
-        "fused",
-        "window_left",
-        "window_right",
-    ]
+    # Row schema (names + order) comes from BenchConfig.to_dict(); configs are
+    # non-empty here (run_benchmark returns early otherwise).
+    x_names = list(run.configs[0].to_dict())
     return [
         triton.testing.Benchmark(
             x_names=x_names,
-            x_vals=[c.to_tuple() for c in run.configs],
+            x_vals=[tuple(c.to_dict().values()) for c in run.configs],
             line_arg="provider",
             line_vals=[run.unit],
             line_names=[run.unit],
@@ -459,24 +450,8 @@ class _CsvWriter:
 
         os.makedirs(run.save_path, exist_ok=True)
         self._path = os.path.join(run.save_path, f"{run.plot_name}.csv")
-        header = [
-            "model",
-            "BATCH",
-            "HQ",
-            "HK",
-            "N_CTX_Q",
-            "N_CTX_K",
-            "D_HEAD",
-            "D_HEAD_V",
-            "causal",
-            "function",
-            "dtype",
-            "impl",
-            "fused",
-            "window_left",
-            "window_right",
-            run.unit,
-        ]
+        # Header = the row's key columns (from to_dict) + the metric (the unit).
+        header = [*run.configs[0].to_dict(), run.unit]
         with open(self._path, "w") as f:
             f.write(",".join(header) + "\n")
 
@@ -487,8 +462,8 @@ class _CsvWriter:
             self._skipped += 1
             return
         with open(self._path, "a") as f:
-            row = ",".join(str(x) for x in config.to_tuple()) + f",{value}\n"
-            f.write(row)
+            cells = [*config.to_dict().values(), value]
+            f.write(",".join(str(x) for x in cells) + "\n")
         self._written += 1
 
     def summary(self) -> None:
@@ -524,6 +499,9 @@ def run_benchmark(run: BenchRun):
     filtered = _filter_by_memory(run.configs)
     if len(filtered) < len(run.configs):
         run = dataclasses.replace(run, configs=filtered)
+    if not run.configs:
+        print("[bench] no configs to run (all filtered by memory).", flush=True)
+        return
     total = len(run.configs)
     counter = 0
     csv = _CsvWriter(run)
