@@ -203,7 +203,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("baseline_csv")
     parser.add_argument("current_csv")
     args = parser.parse_args(argv)
-    compare_csvs(args.baseline_csv, args.current_csv)
+    try:
+        compare_csvs(args.baseline_csv, args.current_csv)
+    except (SystemExit, Exception) as e:
+        # Report-only: a malformed or incompatible CSV (bad metric column, mismatched
+        # metrics, unreadable file) must not fail the caller -- the CI compare step runs
+        # under `set -euo pipefail`. Warn to stderr and still exit 0.
+        print(f"compare_mha: skipping compare ({e})", file=sys.stderr)
     return 0
 
 

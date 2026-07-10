@@ -944,7 +944,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         "--window-size-left",
         type=int,
         default=-1,
-        help="left sliding window size (-1 disables sliding window attention)",
+        help="left sliding window size (-1 = no left bound; dense only when both -1)",
     )
     parser.add_argument(
         "--window-size-right",
