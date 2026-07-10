@@ -46,6 +46,11 @@ class BenchRun:
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
 
+# The (left, right) window variants the default sweep benches: dense + a representative
+# causal sliding window. A swept axis like the default function/dtype sets; override with
+# --window-size-left/right to bench one specific window instead.
+DEFAULT_WINDOWS = [(-1, -1), (1024, 0)]
+
 
 @dataclass(frozen=True)
 class BenchConfig:
@@ -62,15 +67,15 @@ class BenchConfig:
     impl: str = "default"  # "default" or "dao_ai"
     fused: bool = False
     model: str | None = None
-    # Sliding window (left, right) for THIS config. (-1, -1) is dense (off); an
-    # active window has left >= 0 and right >= 0 (the bwd kernel has no infinite-
-    # right path). Per-config so a run can sweep dense vs sliding-window in one pass.
+    # Sliding window (left, right) for THIS config. (-1, -1) is dense (off); either
+    # bound >= 0 makes it a window (-1 on a side means unbounded that side).
     window_size_left: int = -1
     window_size_right: int = -1
 
     @property
     def has_sliding_window(self) -> bool:
-        return self.window_size_left >= 0
+        # dense iff BOTH bounds are off (-1); either set = a window (kernel semantics).
+        return self.window_size_left >= 0 or self.window_size_right >= 0
 
     def __str__(self) -> str:
         label = self.model or "custom"
@@ -231,6 +236,7 @@ def _make_kvcache_fn(q, k_cache, v_cache, **kw):
         cache_seqlens=kw["cache_seqlens"],
         softmax_scale=kw["sm_scale"],
         causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
     )
 
 
@@ -282,41 +288,12 @@ def make_workloads(
     return prefill, decode
 
 
-# Default left window swept alongside the dense (no-window) pass on the dao_ai
-# path, so a normal run exercises sliding-window attention without a magic flag in
-# the caller. Representative mid-size causal window; override with
-# --window-size-left.
-DEFAULT_SWA_WINDOW_LEFT = 1024
-
-
-def _window_variants(impl: str, dtype_str: str, args) -> list[tuple[int, int]]:
-    """The (left, right) windows to sweep for one base config.
-
-    Dense (-1, -1) is always present. A sliding-window variant is added only where
-    the kernel supports it — the dao_ai impl (forward + the fused-mode backward)
-    for non-fp8 dtypes — so a normal `-impl dao_ai` run compares dense vs sliding
-    window in one sweep. An explicit --window-size-left runs THAT window instead of
-    the default (a focused SWA run). On an unsupported path an explicit window is
-    kept (it will skip with a clear message); otherwise the path stays dense-only.
-    """
-    user_window = args.window_size_left >= 0
-    # An active window needs a finite right edge; default to 0 (a causal window)
-    # when the user didn't set one (--window-size-right stays at the -1 off
-    # sentinel). The kernel rejects an active window with right < 0.
-    right = args.window_size_right if args.window_size_right >= 0 else 0
-    if impl == "dao_ai" and dtype_str != "fp8":
-        wl = args.window_size_left if user_window else DEFAULT_SWA_WINDOW_LEFT
-        return [(wl, right)] if user_window else [(-1, -1), (wl, right)]
-    if user_window:
-        return [(args.window_size_left, right)]
-    return [(-1, -1)]
-
-
 def model_benchmark_configs(
     args,
     *,
     dtypes: list[str],
     functions: list[str],
+    windows: list[tuple[int, int]],
     impl: str,
     fused: bool,
     model: str | None = None,
@@ -360,7 +337,7 @@ def model_benchmark_configs(
             for fn in workload_fns:
                 if fn not in functions:
                     continue
-                for wl, wr in _window_variants(impl, d, args):
+                for wl, wr in windows:
                     fa_configs.append(
                         BenchConfig(
                             model=model_name,
@@ -536,7 +513,9 @@ def run_benchmark(run: BenchRun):
         label = model or "custom"
         mem_gb = config.estimated_memory / 1e9
         window_str = (
-            f" window=({window_left},{window_right})" if window_left >= 0 else ""
+            f" window=({window_left},{window_right})"
+            if window_left >= 0 or window_right >= 0
+            else ""
         )
         print(
             f"[{counter}/{total}] {label} B={BATCH} HQ={HQ} HK={HK} "
@@ -607,23 +586,18 @@ def run_benchmark(run: BenchRun):
         return_lse = True
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
-        # Per-config window (the sweep sets it). left < 0 is dense; an active window
-        # carries a right >= 0 (the bwd kernel has no infinite-right path).
-        has_sliding_window = window_size_left >= 0
-        window_size = (
-            (window_size_left, window_size_right) if has_sliding_window else (-1, -1)
-        )
+        # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
+        # `LEFT < 0 and RIGHT < 0` dense test -- neither side is privileged).
+        has_sliding_window = window_size_left >= 0 or window_size_right >= 0
+        window_size = (window_size_left, window_size_right)
         if impl != "default":
             mha_set_impl(impl)
-        # Sliding window is supported only on the dao_ai impl (forward, plus the
-        # fused-mode backward that BWD_MODE defaults to) and not in fp8: the default
-        # impl forwards no window and fp8 has no SWA path. (-fused_bwd toggles the
-        # aiter-native fused kernel, which the dao_ai impl bypasses, so it does not
-        # gate SWA.) Skip the unsupported combos cleanly instead of hard-erroring
-        # mid-sweep.
-        if has_sliding_window and (impl != "dao_ai" or dtype == "fp8"):
+        # SWA runs on the dao_ai path (any dtype) and the fp8 path (routes to FA3, which
+        # has it); only native non-fp8 lacks it (left-only, right rejected). Skip that
+        # combo cleanly rather than hard-error mid-sweep.
+        if has_sliding_window and impl != "dao_ai" and dtype != "fp8":
             warnings.warn(
-                "Skipping: sliding window requires -impl dao_ai and a non-fp8 dtype."
+                "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
         if (fused or dtype == "fp8") and (has_pe or run.sink):
@@ -976,9 +950,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         "--window-size-right",
         type=int,
         default=-1,
-        help="right sliding window size; used only when --window-size-left >= 0. "
-        "Defaults to a causal window (right=0) when a window is active; the backward "
-        "kernel has no infinite-right path, so an active window needs right >= 0.",
+        help="right sliding window size (-1 = no right bound)",
     )
     parsed = parser.parse_args(args=args)
 
@@ -1018,6 +990,11 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
     impl = parsed.impl
     fused = parsed.fused_bwd
     functions = [parsed.fn] if parsed.fn else sorted(VALID_FUNCTIONS)
+    windows = (
+        [(parsed.window_size_left, parsed.window_size_right)]
+        if parsed.window_size_left >= 0 or parsed.window_size_right >= 0
+        else DEFAULT_WINDOWS
+    )
     d_head = parsed.d if parsed.d else 128
     d_head_v = parsed.dv if parsed.dv else d_head
 
@@ -1044,13 +1021,14 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
                 window_size_right=wr,
             )
             for c, fn, d in itertools.product(causals, functions, dtypes)
-            for wl, wr in _window_variants(impl, d, parsed)
+            for wl, wr in windows
         ]
     elif parsed.model:
         configs = model_benchmark_configs(
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
             model=parsed.model,
@@ -1060,6 +1038,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
             parsed,
             dtypes=dtypes,
             functions=functions,
+            windows=windows,
             impl=impl,
             fused=fused,
         )
