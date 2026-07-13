@@ -482,9 +482,12 @@ jobs:
         if: steps.current.outputs.found == 'true'
         run: |
           set -euo pipefail
-          baseline_csv=$(find /tmp/baseline_pinned -name bench_mha.csv 2>/dev/null | head -1)
+          # The download steps may not create these dirs when no artifact is found;
+          # mkdir + `|| true` keep the no-baseline path from aborting under pipefail.
+          mkdir -p /tmp/baseline_pinned /tmp/baseline_main
+          baseline_csv=$(find /tmp/baseline_pinned -name bench_mha.csv 2>/dev/null | head -1 || true)
           if [[ -z "$baseline_csv" ]]; then
-            baseline_csv=$(find /tmp/baseline_main -name bench_mha.csv 2>/dev/null | head -1)
+            baseline_csv=$(find /tmp/baseline_main -name bench_mha.csv 2>/dev/null | head -1 || true)
           fi
           if [[ -z "$baseline_csv" ]]; then
             echo "::warning::No MHA bench baseline found; skipping perf compare."

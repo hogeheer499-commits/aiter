@@ -12,6 +12,7 @@ from aiter.ops.triton.attention.mha import (
 )
 from aiter.test_mha_common import (
     attention_ref,
+    attention_ref_with_tol,
     generate_random_padding_mask,
     generate_qkv,
 )
@@ -205,28 +206,43 @@ def test_mha_dao_ai(
                 q, k, v, causal=CAUSAL, window_size=WINDOW_SIZE
             )
 
-    # Forward check against PyTorch reference
-    q_ref = q.detach().clone().requires_grad_(BWD)
-    k_ref = k.detach().clone().requires_grad_(BWD)
-    v_ref = v.detach().clone().requires_grad_(BWD)
-    torch_out, _, _ = attention_ref(
-        q_ref,
-        k_ref,
-        v_ref,
-        causal=CAUSAL,
-        window_size=WINDOW_SIZE,
-        query_padding_mask=query_padding_mask,
-        key_padding_mask=key_padding_mask,
-    )
-    if VARLEN:
-        triton_out_padded = output_pad_fn(triton_out)
-        torch.testing.assert_close(triton_out_padded, torch_out, atol=1e-2, rtol=1e-2)
+    # Reference + tolerances. For backward, attention_ref_with_tol derives each
+    # tensor's atol from the fp32-vs-bf16 reference gap (upstream FA pattern, as in
+    # test_mha_v3): bf16 gradient reductions -- largest under MQA / long seqlen --
+    # outrun a fixed 1e-2 atol.
+    do = torch.randn_like(q) if BWD else None
+    if BWD:
+        torch_out, (torch_dq, torch_dk, torch_dv), fwd_tol, bwd_tols = (
+            attention_ref_with_tol(
+                q,
+                k,
+                v,
+                do,
+                causal=CAUSAL,
+                window_size=WINDOW_SIZE,
+                query_padding_mask=query_padding_mask,
+                key_padding_mask=key_padding_mask,
+            )
+        )
     else:
-        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+        torch_out, _, _ = attention_ref(
+            q,
+            k,
+            v,
+            causal=CAUSAL,
+            window_size=WINDOW_SIZE,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+        )
+        fwd_tol = (1e-2, 1e-2)
+
+    # Forward check against PyTorch reference
+    fwd_atol, fwd_rtol = fwd_tol
+    triton_out_fwd = output_pad_fn(triton_out) if VARLEN else triton_out
+    torch.testing.assert_close(triton_out_fwd, torch_out, atol=fwd_atol, rtol=fwd_rtol)
 
     # Backward check against PyTorch reference
     if BWD:
-        do = torch.randn_like(q)
         if VARLEN:
             triton_out = output_pad_fn(triton_out)
             triton_dq, triton_dk, triton_dv = torch.autograd.grad(
@@ -240,31 +256,19 @@ def test_mha_dao_ai(
                 triton_out, (q, k, v), do
             )
 
-        torch_dq, torch_dk, torch_dv = torch.autograd.grad(
-            torch_out, (q_ref, k_ref, v_ref), do
-        )
-
-        torch.testing.assert_close(
-            triton_dq,
-            torch_dq,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dq mismatch\n\n{msg}\n",
-        )
-        torch.testing.assert_close(
-            triton_dk,
-            torch_dk,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dk mismatch\n\n{msg}\n",
-        )
-        torch.testing.assert_close(
-            triton_dv,
-            torch_dv,
-            atol=1e-2,
-            rtol=1e-2,
-            msg=lambda msg: f"dao_ai bwd dv mismatch\n\n{msg}\n",
-        )
+        for tri, ref, (atol, rtol), name in zip(
+            (triton_dq, triton_dk, triton_dv),
+            (torch_dq, torch_dk, torch_dv),
+            bwd_tols,
+            ("dq", "dk", "dv"),
+        ):
+            torch.testing.assert_close(
+                tri,
+                ref,
+                atol=atol,
+                rtol=rtol,
+                msg=lambda m, name=name: f"dao_ai bwd {name} mismatch\n\n{m}\n",
+            )
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
