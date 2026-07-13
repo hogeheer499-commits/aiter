@@ -6,6 +6,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
@@ -38,7 +39,10 @@ def launch_gemm_a8w4_tdm(
     layout_mbn: Constexpr[int],
     num_buffers: Constexpr[int],
     a_is_fp4: Constexpr[int],
+    cluster_m: Constexpr[int],
+    cluster_n: Constexpr[int],
 ):
+    use_cluster = cluster_m > 1 or cluster_n > 1
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -102,6 +106,11 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
+        if const_expr(use_cluster):
+            local_x, local_y = cluster.compute_cluster_position()
+            a_mask, b_mask = cluster.compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        else:
+            a_mask, b_mask = 0, 0
         blk_m = bid_x * tile_m
         blk_n = bid_y * tile_n
         blk_m64 = fx.Int64(blk_m)  # i64 element offsets keep address math off fx.index
@@ -142,8 +151,11 @@ def launch_gemm_a8w4_tdm(
         def _lv(ptr, shape, stride):  # LDS ring-slot view
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
-        def _tdm(gt, outer, stride):  # 2-D TDM atom; outer clamps dim0, stride = runtime outer stride
-            return fx.rocdl.make_tdm_atom(gt, [outer, None], strides=[stride, None], num_warps=num_waves)
+        def _tdm(gt, outer, stride, mask=0, early_timeout=True):  # 2-D TDM atom; outer clamps dim0, stride = runtime outer stride
+            atom = fx.rocdl.make_tdm_atom(
+                gt, [outer, None], strides=[stride, None], num_warps=num_waves, early_timeout=early_timeout,
+            )
+            return fx.atom_set_value(atom, "workgroup_mask", mask)
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -170,10 +182,11 @@ def launch_gemm_a8w4_tdm(
         gtSB0 = _gv(gSB_base, sb_off0, SBT, (SC_INNER, 1))
         atomA = fx.rocdl.make_tdm_atom(
             gtA0, [mn_oob, None], strides=[A_OUTER_STRIDE, None], num_warps=num_waves,
-            pad_interval=A_ROW_B, pad_amount=LDS_PAD_A,
+            pad_interval=A_ROW_B, pad_amount=LDS_PAD_A, early_timeout=True,
         )
-        atomB = _tdm(gtB0, None, Kp16)
-        atomSA, atomSB = _tdm(gtSA0, sa_oob, SA_OUTER_STRIDE), _tdm(gtSB0, None, SB_OUTER_STRIDE)
+        atomA = fx.atom_set_value(atomA, "workgroup_mask", a_mask)
+        atomB = _tdm(gtB0, None, Kp16, b_mask)
+        atomSA, atomSB = _tdm(gtSA0, sa_oob, SA_OUTER_STRIDE, a_mask), _tdm(gtSB0, None, SB_OUTER_STRIDE, b_mask)
         _adv = fx.rocdl.advance_tdm_atom
 
         base_i32 = fx.recast_iter(fx.Int32, base_ptr)  # aligned base for i32 scale views
@@ -303,20 +316,20 @@ def launch_gemm_a8w4_tdm(
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=use_cluster)
             compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
         # Tail: last (num_buffers-1) tiles are resident; drain progressively.
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=use_cluster)
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
 
         # Epilogue: stage the WMMA tile through LDS, then TDM-store to global.
-        pipeline_fence(outstanding=0)
+        pipeline_fence(outstanding=0, use_cluster=use_cluster)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
@@ -324,19 +337,23 @@ def launch_gemm_a8w4_tdm(
                 h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
                 i32v = fx.vector.bitcast(T.vec(4, T.i32), h)
                 lds_store_b128_raw(stC_idx, (row_rel * tile_n + col_rel) * 2, i32v)
-        workgroup_barrier()
+        workgroup_barrier(use_cluster=use_cluster)
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = c_outer_off * fx.Int64(c_stride) + c_inner_off
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
-        atomC = _tdm(gtC, mn_oob, c_stride)  # runtime N stride via strides=
+        atomC = _tdm(gtC, mn_oob, c_stride, early_timeout=False)  # runtime N stride via strides=
         fx.copy(atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC)
         tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, N, K).launch(
-        grid=(gx, gy, batch), block=(block, 1, 1), stream=stream
-    )
+    if use_cluster:
+        gx = ((gx + (cluster_m - 1)) // cluster_m) * cluster_m
+    cluster_arg = (cluster_m, cluster_n, 1) if use_cluster else None
+    kernel(
+        arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, N, K,
+        value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None},
+    ).launch(grid=(gx, gy, batch), block=(block, 1, 1), stream=stream, cluster=cluster_arg)
 
 
 # amdgpu expert instruction scheduler: denser WMMA/DMA interleave (mirrors gemm_fp8fp4).
