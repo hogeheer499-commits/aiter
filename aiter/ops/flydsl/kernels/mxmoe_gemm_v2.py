@@ -1045,6 +1045,7 @@ def gemm2_body_v2(
     g2_bhoist=True,
     g2_ascale_pf=True,
     g2_bf16_lds=False,
+    route_out_fp8=False,
 ):
     # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     if g2_kstages not in (1, 2):
@@ -1450,6 +1451,7 @@ def gemm2_body_v2(
         topk=topk,
         SBM=SBM,
         g2_bf16_lds=g2_bf16_lds,
+        route_out_fp8=route_out_fp8,
     )
 
 
@@ -1472,6 +1474,7 @@ def atomic_bf16_epilog(
     topk=1,
     SBM=None,
     g2_bf16_lds=False,
+    route_out_fp8=False,
 ):
     if SBM is None:
         SBM = BM
@@ -1486,6 +1489,8 @@ def atomic_bf16_epilog(
     m_lane = tx_i32 // 32
     n_lane = tx_i32 % 32
     col_start = n_lane * 2
+    fp8_group_lane = n_lane // fx.Int32(4)
+    fp8_lane_in_group = n_lane & fx.Int32(3)
     stids_base = global_base_ptr1(arg_stids)
     sweights_base = global_base_ptr1(arg_sweights)
     out_base = global_base_ptr1(arg_out)
@@ -1542,13 +1547,85 @@ def atomic_bf16_epilog(
         if const_expr(use_reduce):
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
             out_row = fx.Int64(token_id * fx.Int32(topk) + (packed[mr] >> fx.Int32(24)))
-            row_base_addr = out_row * fx.Int64(N_OUT) + fx.Int64(n_block_idx * BN + col_start)
+            if const_expr(route_out_fp8):
+                row_base_addr = out_row * fx.Int64(N_OUT + (N_OUT // fx.Int32(8)))
+            else:
+                row_base_addr = out_row * fx.Int64(N_OUT) + fx.Int64(n_block_idx * BN + col_start)
         else:
             out_row = token_id
             row_base_addr = out_row * N_OUT + n_block_idx * BN + col_start
         for s in range_constexpr(4):
             # adjacent ee=0,1 contiguous -> one 2-wide load.
             idx0 = row_in_block * BN + col_start + s * 64
+            if const_expr(use_reduce and route_out_fp8):
+                _if_fp8_lane = scf.IfOp(_raw(fp8_lane_in_group == fx.Int32(0)))
+                with ir.InsertionPoint(_if_fp8_lane.then_block):
+                    col_g0 = n_block_idx * BN + fp8_group_lane * fx.Int32(8) + fx.Int32(s * 64)
+                    vals = []
+                    for q in range_constexpr(8):
+                        idx_q = row_in_block * BN + fp8_group_lane * fx.Int32(8) + fx.Int32(s * 64 + q)
+                        vals.append(fx.Float32(lds_base_fptr[idx_q]) * weight[mr])
+                    local_max = fabs_f32(vals[0])
+                    for q in range_constexpr(1, 8):
+                        local_max = local_max.maximumf(fabs_f32(vals[q]))
+                    amax_bits = fx.Int32(_raw(local_max).bitcast(T.i32))
+                    ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
+                    e8m0 = ax_e - fx.Int32(7)
+                    e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
+                    e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
+                    quant_scale = fx.Float32(
+                        _raw((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(T.f32)
+                    )
+                    scaled = [vals[q] * quant_scale for q in range_constexpr(8)]
+                    packed_lo = arith.constant(0, type=T.i32)
+                    packed_lo = rocdl.cvt_pk_fp8_f32(
+                        T.i32, scaled[0], scaled[1], packed_lo, 0
+                    )
+                    packed_lo = rocdl.cvt_pk_fp8_f32(
+                        T.i32, scaled[2], scaled[3], packed_lo, 1
+                    )
+                    packed_hi = arith.constant(0, type=T.i32)
+                    packed_hi = rocdl.cvt_pk_fp8_f32(
+                        T.i32, scaled[4], scaled[5], packed_hi, 0
+                    )
+                    packed_hi = rocdl.cvt_pk_fp8_f32(
+                        T.i32, scaled[6], scaled[7], packed_hi, 1
+                    )
+                    row_val_off = row_base_addr + fx.Int64(col_g0)
+                    packed_lo_raw = (
+                        packed_lo._value if hasattr(packed_lo, "_value") else packed_lo
+                    )
+                    packed_hi_raw = (
+                        packed_hi._value if hasattr(packed_hi, "_value") else packed_hi
+                    )
+                    llvm.StoreOp(
+                        packed_lo_raw,
+                        gep1(out_base, row_val_off),
+                        alignment=4,
+                        nontemporal=True,
+                    )
+                    llvm.StoreOp(
+                        packed_hi_raw,
+                        gep1(out_base, row_val_off + fx.Int64(4)),
+                        alignment=4,
+                        nontemporal=True,
+                    )
+                    scale_off = (
+                        row_base_addr
+                        + fx.Int64(N_OUT)
+                        + fx.Int64(col_g0 // fx.Int32(8))
+                    )
+                    e8m0_i8 = arith.TruncIOp(T.i8, _raw(e8m0))
+                    e8m0_raw = (
+                        e8m0_i8.result
+                        if hasattr(e8m0_i8, "result")
+                        else (e8m0_i8._value if hasattr(e8m0_i8, "_value") else e8m0_i8)
+                    )
+                    llvm.StoreOp(
+                        e8m0_raw, gep1(out_base, scale_off), alignment=1, nontemporal=True
+                    )
+                    scf.YieldOp([])
+                continue
             if const_expr(g2_bf16_lds):
                 pk = Vec(lds_vec_load(lds_acc_base, idx0 * 2, Vec.make_type(2, fx.BFloat16), fx.BFloat16, align=4))
             else:
