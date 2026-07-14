@@ -313,22 +313,22 @@ def launch_gemm_a8w4_tdm(
             rocdl.sched_barrier(0)
 
         TDM_PER = 1 if WS8 else 2  # per-wave loads/K-tile (scales share A/B waves at <8)
-        # Prologue preloads nb-1 K-tiles; the steady loop issues tile kt+nb-1 mid-
+        # Prologue preloads nb K-tiles; the steady loop issues tile kt+nb mid-
         # compute into the slot the fence just freed (one fence/barrier per K-tile).
-        for i in range_constexpr(num_buffers - 1):
+        for i in range_constexpr(num_buffers):
             issue(i, i)
-        n_steady = K_TILES - (num_buffers - 1)
+        n_steady = K_TILES - num_buffers
         for kt in range(n_steady):
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-            compute_ktile(buf, kt + (num_buffers - 1))   # prefetch this tile mid-compute
-        # Tail: last (num_buffers-1) tiles are resident; drain progressively.
-        for j in range_constexpr(num_buffers - 1):
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1))
+            compute_ktile(buf, kt + num_buffers)   # prefetch this tile mid-compute
+        # Tail: last num_buffers tiles are resident; drain progressively.
+        for j in range_constexpr(num_buffers):
             kt = n_steady + j
             s = kt % num_buffers
             buf = _bidx(_buf_ptr(s))
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+            pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
             compute_ktile(buf, None)
 
         accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
