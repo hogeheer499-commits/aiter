@@ -110,7 +110,7 @@ def should_test_hipb_gelu(dtype, m, n, k, quantDtype):
 
 @perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
+    return aiter.gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype)
 
 
 @perftest()
