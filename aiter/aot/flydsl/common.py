@@ -47,6 +47,7 @@ class JobLabel:
 
 
 _CU_NUM_TO_ARCH = {
+    64: "gfx942",
     80: "gfx942",
     304: "gfx942",
     256: "gfx950",
